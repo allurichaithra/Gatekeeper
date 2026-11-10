@@ -1,0 +1,24 @@
+{
+  "name": "@gatekeeper/control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/main.js",
+    "build": "node --check src/main.js",
+    "start": "node src/main.js",
+    "test": "node --test",
+    "lint": "eslint .",
+    "typecheck": "node --check src/main.js",
+    "db:status": "node -e \"console.log('SQLite schema is initialized automatically on startup')\""
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.22.0",
+    "eslint": "^9.22.0",
+    "globals": "^16.0.0"
+  }
+}

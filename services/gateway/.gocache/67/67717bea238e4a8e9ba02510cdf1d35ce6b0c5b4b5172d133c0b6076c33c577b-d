@@ -1,0 +1,19 @@
+# test log
+getenv GOTMPDIR
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json.last-good
+stat C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\.gateway-config-3105840214.tmp
+stat C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\.gateway-config-2567462972.tmp
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json
+stat C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\.gateway-config-3015336449.tmp
+stat C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\.gateway-config-1319680133.tmp
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\gateway.json
+stat C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001
+open C:\Users\allur\AppData\Local\Temp\TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood4075226510\001\.gateway-config-1086166700.tmp
+open C:\Users\allur\AppData\Local\Temp

@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Node.js
+node_modules/
+dist/
+coverage/
+.vite/
+npm-debug.log*
+/.gocache/
+
+# Go
+**/vendor/
+*.test
+*.out
+
+# Python
+__pycache__/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local runtime data
+data/
+*.log

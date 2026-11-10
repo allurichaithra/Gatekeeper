@@ -1,0 +1,23 @@
+{
+  "name": "gatekeeper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Smarter Traffic. Faster Responses. Reliable Systems.",
+  "workspaces": [
+    "services/control-plane",
+    "apps/dashboard"
+  ],
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "npm run lint --workspace @gatekeeper/control-plane && npm run lint --workspace @gatekeeper/dashboard",
+    "typecheck": "npm run typecheck --workspace @gatekeeper/control-plane && npm run typecheck --workspace @gatekeeper/dashboard",
+    "test:gateway": "go -C services/gateway test ./...",
+    "test:control-api": "npm run test --workspace @gatekeeper/control-plane",
+    "test:sample-services": "npm run test --prefix services/user-service && npm run test --prefix services/product-service",
+    "start:local": "powershell -ExecutionPolicy Bypass -File ./scripts/start-all.ps1"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3"
+  }
+}
