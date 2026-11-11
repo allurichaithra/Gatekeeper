@@ -74,6 +74,33 @@ test('authentication, authorization, internal API key and audit history', async 
     headers: { authorization: `Bearer ${viewerToken}` },
   });
   assert.equal(permittedView.status, 200);
+  assert.equal(
+    (
+      await controlFetch(`${base}/api/config/history`, {
+        headers: { authorization: `Bearer ${viewerToken}` },
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await controlFetch(`${base}/api/config/rollback/0`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${viewerToken}` },
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await controlFetch(`${base}/api/alerts/rules`, {
+        method: 'PUT',
+        headers: { authorization: `Bearer ${viewerToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ errorRate: 0.1, p95LatencyMs: 100, trafficSpikeMultiplier: 2 }),
+      })
+    ).status,
+    403,
+  );
   assert.equal((await fetch(`${base}/internal/gateway/config`)).status, 401);
   const internal = await fetch(`${base}/internal/gateway/config`, {
     headers: {
@@ -138,6 +165,26 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
     db.close();
     rmSync(directory, { recursive: true, force: true });
   });
+  const excessiveUpstreams = await controlFetch(`${base}/api/services`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      name: 'too-many-upstreams',
+      upstreams: Array.from({ length: 101 }, () => 'http://localhost:4001'),
+    }),
+  });
+  assert.equal(excessiveUpstreams.status, 400);
+  const invalidAlerts = await controlFetch(`${base}/api/alerts/rules`, {
+    method: 'PUT',
+    body: JSON.stringify({ errorRate: 3, p95LatencyMs: 100, trafficSpikeMultiplier: 2 }),
+  });
+  assert.equal(invalidAlerts.status, 400);
+  const alertRules = await controlFetch(`${base}/api/alerts/rules`, {
+    method: 'PUT',
+    body: JSON.stringify({ errorRate: 0.08, p95LatencyMs: 750, trafficSpikeMultiplier: 2.5 }),
+  });
+  assert.equal(alertRules.status, 200);
+  assert.equal(db.prepare('SELECT errorRate FROM alert_rules WHERE id=1').get().errorRate, 0.08);
   const createService = await controlFetch(`${base}/api/services`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -163,6 +210,18 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
       spikeSensitivity: 2.5,
       recoveryCooldownMs: 5000,
       cacheTtlMs: 1000,
+      loadBalancingAlgorithm: 'LEAST_CONNECTIONS',
+      circuitBreakerEnabled: true,
+      circuitFailureThreshold: 4,
+      circuitRecoveryTimeoutMs: 15000,
+      circuitHalfOpenProbes: 2,
+      maxRetries: 2,
+      retryBackoffMs: 25,
+      retryMaxBackoffMs: 250,
+      retryJitter: true,
+      retryStatuses: [502, 503],
+      retryConnectionErrors: true,
+      retryTimeouts: true,
     }),
   });
   assert.equal(createRoute.status, 201);
@@ -182,6 +241,15 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
   assert.equal(config.routes[0].spikeSensitivity, 2.5);
   assert.equal(config.routes[0].recoveryCooldownMs, 5000);
   assert.equal(config.routes[0].targets[0].url, 'http://localhost:4001');
+  assert.equal(config.routes[0].loadBalancingAlgorithm, 'LEAST_CONNECTIONS');
+  assert.equal(config.routes[0].circuitBreakerEnabled, true);
+  assert.equal(config.routes[0].circuitFailureThreshold, 4);
+  assert.equal(config.routes[0].circuitRecoveryTimeoutMs, 15000);
+  assert.equal(config.routes[0].circuitHalfOpenProbes, 2);
+  assert.equal(config.routes[0].maxRetries, 2);
+  assert.deepEqual(config.routes[0].retryStatuses, [502, 503]);
+  assert.equal(config.routes[0].retryConnectionErrors, true);
+  assert.equal(config.routes[0].retryTimeouts, true);
   const badUpdate = await controlFetch(`${base}/api/routes/${config.routes[0].id}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -193,6 +261,27 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
     }),
   });
   assert.equal(badUpdate.status, 400);
+  const unsupportedBalancer = await controlFetch(`${base}/api/routes/${config.routes[0].id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      serviceId: service.id,
+      path: '/api/users',
+      loadBalancingAlgorithm: 'MAGIC',
+    }),
+  });
+  assert.equal(unsupportedBalancer.status, 400);
+  const invalidCircuit = await controlFetch(`${base}/api/routes/${config.routes[0].id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      serviceId: service.id,
+      path: '/api/users',
+      circuitBreakerEnabled: true,
+      circuitFailureThreshold: 0,
+    }),
+  });
+  assert.equal(invalidCircuit.status, 400);
   const invalidAdaptive = await controlFetch(`${base}/api/routes/${config.routes[0].id}`, {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
@@ -290,6 +379,58 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
   assert.equal(current.routes[0].timeoutMs, 7000);
   assert.equal(current.routes[0].enabled, false);
   assert.equal(current.routes[0].rateLimitMode, 'FIXED');
+  const history = await controlFetch(`${base}/api/config/history`).then((response) =>
+    response.json(),
+  );
+  assert.equal(history.activeVersion, 3);
+  assert.ok(
+    history.versions.some((entry) => entry.version === 1 && entry.actorUsername === 'admin-test'),
+  );
+  const comparison = await controlFetch(`${base}/api/config/history/compare?from=1&to=3`).then(
+    (response) => response.json(),
+  );
+  assert.ok(
+    comparison.changes.some(
+      (change) => change.kind === 'changed' && change.fields.includes('timeoutMs'),
+    ),
+  );
+  const rollback = await controlFetch(`${base}/api/config/rollback/3`, { method: 'POST' });
+  assert.equal(rollback.status, 200, await rollback.clone().text());
+  const rollbackResult = await rollback.json();
+  assert.equal(rollbackResult.rollbackOf, 3);
+  assert.equal(
+    JSON.parse(readFileSync(process.env.GATEWAY_CONFIG_FILE, 'utf8')).routes[0].enabled,
+    false,
+  );
+  assert.ok(db.prepare("SELECT 1 FROM audit_logs WHERE action='ROLLBACK' LIMIT 1").get());
+  const invalidRollback = await controlFetch(`${base}/api/config/rollback/99999`, {
+    method: 'POST',
+  });
+  assert.equal(invalidRollback.status, 404);
+  const invalidCanary = await controlFetch(`${base}/api/routes/${config.routes[0].id}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      serviceId: service.id,
+      path: '/api/users',
+      methods: ['GET'],
+      timeoutMs: 5000,
+      upstreamGroups: [
+        {
+          id: 'stable',
+          name: 'Stable',
+          percentage: 90,
+          targets: [{ url: 'http://localhost:4001', weight: 1 }],
+        },
+        {
+          id: 'canary',
+          name: 'Canary',
+          percentage: 5,
+          targets: [{ url: 'http://localhost:4001', weight: 1 }],
+        },
+      ],
+    }),
+  });
+  assert.equal(invalidCanary.status, 400);
   assert.equal(
     (
       await controlFetch(`${base}/api/routes/${config.routes[0].id}/adaptive/override`, {
@@ -307,6 +448,7 @@ test('control API stores entities in SQLite and publishes gateway snapshots', as
   assert.equal((await controlFetch(`${base}/api/routes`)).status, 200);
   const persisted = new DatabaseSync(sqliteFile);
   assert.equal(persisted.prepare('SELECT count(*) n FROM routes').get().n, 1);
+  assert.ok(persisted.prepare('SELECT count(*) n FROM config_history').get().n >= 5);
   persisted.close();
   assert.equal(
     (await controlFetch(`${base}/api/routes/${config.routes[0].id}`, { method: 'DELETE' })).status,

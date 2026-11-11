@@ -15,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -92,6 +94,34 @@ func New(cfg Config) (*http.Server, error) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(manager.Metrics())
+	})))
+	mux.Handle("/api/gateway/requests", requireGatewayKey(cfg.AdminToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		filters := map[string]string{"route": r.URL.Query().Get("route"), "status": r.URL.Query().Get("status"), "upstream": r.URL.Query().Get("upstream"), "requestId": r.URL.Query().Get("requestId")}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(manager.RequestHistory(filters, limit))
+	})))
+	mux.Handle("/api/gateway/requests/", requireGatewayKey(cfg.AdminToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/gateway/requests/")
+		if id == "" || strings.Contains(id, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		request, ok := manager.RequestByID(id)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(request)
 	})))
 	mux.Handle("/api/gateway/routes", requireGatewayKey(cfg.AdminToken, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -339,6 +369,12 @@ type statusWriter struct {
 }
 
 func (w *statusWriter) WriteHeader(status int) {
+	// Informational responses such as 100 Continue do not finish the response.
+	// Let the final upstream status replace them in the request metrics/logs.
+	if status >= 100 && status < 200 && status != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
 	if w.status != 0 {
 		return
 	}

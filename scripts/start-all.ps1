@@ -9,7 +9,7 @@ if (Test-Path -LiteralPath $processFile) {
     if ($existing -and $existing.Path -eq $record.path -and $existing.StartTime.ToUniversalTime().ToString('o') -eq $record.startedAt) { throw 'Gatekeeper appears to be running already. Run ./scripts/stop-all.ps1 first.' }
   }
 }
-$logDirectory = Join-Path $dataDirectory (Join-Path 'logs' (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+$logDirectory = if ($env:GATEKEEPER_LOG_DIRECTORY) { $env:GATEKEEPER_LOG_DIRECTORY } else { Join-Path $dataDirectory (Join-Path 'logs' (Get-Date -Format 'yyyyMMdd-HHmmss-fff')) }
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
 function New-LocalSecret {
@@ -54,7 +54,12 @@ $processes += Start-Process -FilePath 'node.exe' -WindowStyle Hidden -PassThru -
 if ($null -eq $originalPort) { Remove-Item Env:PORT } else { $env:PORT = $originalPort }
 $processes += Start-Process -FilePath 'node.exe' -WindowStyle Hidden -PassThru -ArgumentList (Join-Path $root 'node_modules/vite/bin/vite.js') -WorkingDirectory (Join-Path $root 'apps/dashboard') -RedirectStandardOutput (Join-Path $logDirectory 'dashboard.log') -RedirectStandardError (Join-Path $logDirectory 'dashboard-error.log')
 
-$processRecords = @($processes | ForEach-Object { @{ id = $_.Id; path = $_.Path; startedAt = $_.StartTime.ToUniversalTime().ToString('o') } })
+$processNames = @('gateway', 'control-api', 'user-service', 'product-service', 'dashboard')
+$processRecords = @()
+for ($index = 0; $index -lt $processes.Count; $index++) {
+  $process = $processes[$index]
+  $processRecords += @{ name = $processNames[$index]; id = $process.Id; path = $process.Path; startedAt = $process.StartTime.ToUniversalTime().ToString('o') }
+}
 Set-Content -LiteralPath $processFile -Value (ConvertTo-Json -InputObject $processRecords) -Encoding ascii
 Write-Host "Starting Gatekeeper: dashboard http://localhost:$env:VITE_PORT, gateway $env:GATEWAY_LISTEN_ADDR, control API :$env:CONTROL_API_PORT, services :$env:USER_SERVICE_PORT/:$env:PRODUCT_SERVICE_PORT"
 Write-Host 'Use ./scripts/stop-all.ps1 to stop these processes.'

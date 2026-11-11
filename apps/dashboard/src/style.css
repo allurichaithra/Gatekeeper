@@ -664,6 +664,24 @@ footer {
 .decision-list small {
   grid-column: 2;
 }
+.state-pill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  background: #e8f5ef;
+  color: #20846a;
+}
+.state-pill.open {
+  background: #fff0ef;
+  color: #bd454d;
+}
+.state-pill.half-open {
+  background: #fff4df;
+  color: #9a6518;
+}
 @media (max-width: 900px) {
   .sidebar {
     width: 210px;
@@ -767,4 +785,38 @@ footer {
   place-items: center;
   width: 42px;
   height: 42px;
+}
+.canary-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line, #263244);
+  flex-wrap: wrap;
+}
+.canary-row > div {
+  flex: 1 1 220px;
+}
+.canary-row small {
+  display: block;
+  color: var(--muted, #94a3b8);
+  margin-top: 4px;
+}
+.canary-row label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.canary-row input {
+  width: 84px;
+}
+.full-width {
+  grid-column: 1 / -1;
+}
+.full-width textarea {
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  margin-top: 8px;
+  font-family: ui-monospace, monospace;
 }

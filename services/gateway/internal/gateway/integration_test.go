@@ -81,7 +81,7 @@ func TestHealthEndpoint(t *testing.T) {
 func TestGatewayAdminEndpointsRequireAPIKey(t *testing.T) {
 	proxy := startGateway(t, "http://127.0.0.1:1", time.Second, time.Second)
 	defer proxy.Close()
-	for _, path := range []string{"/health/config", "/api/gateway/metrics", "/api/gateway/routes", "/api/gateway/health", "/api/gateway/adaptive", "/api/gateway/adaptive/history"} {
+	for _, path := range []string{"/health/config", "/api/gateway/metrics", "/api/gateway/routes", "/api/gateway/health", "/api/gateway/requests", "/api/gateway/adaptive", "/api/gateway/adaptive/history"} {
 		for _, token := range []string{"", "Bearer wrong-key"} {
 			request, _ := http.NewRequest(http.MethodGet, proxy.URL+path, nil)
 			if token != "" {
@@ -105,6 +105,53 @@ func TestGatewayAdminEndpointsRequireAPIKey(t *testing.T) {
 		response.Body.Close()
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("GET %s with key returned %d", path, response.StatusCode)
+		}
+	}
+}
+
+func TestRequestInspectorRecordsSanitizedMetadataAndConsistentRequestID(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer backend.Close()
+	manager, err := NewManager("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := testRoute("inspect", "/inspect", "PREFIX", backend.URL)
+	if err := manager.Apply(testSnapshot("1", route)); err != nil {
+		t.Fatal(err)
+	}
+	server, err := New(Config{Addr: ":0", RequestTimeout: time.Second, UpstreamTimeout: time.Second, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), Manager: manager, AdminToken: "integration-secret-key-long-enough"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(server.Handler)
+	defer proxy.Close()
+	request, _ := http.NewRequest(http.MethodGet, proxy.URL+"/inspect/item?private-query=hidden", nil)
+	request.Header.Set("Authorization", "Bearer private-token")
+	request.Header.Set("Cookie", "session=private-cookie")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	id := response.Header.Get(requestIDHeader)
+	if id == "" {
+		t.Fatal("response missing request ID")
+	}
+	record, ok := manager.RequestByID(id)
+	if !ok {
+		t.Fatal("request record missing")
+	}
+	if record.RequestID != id || record.RouteID != route.ID || record.Status != http.StatusOK || record.Upstream != backend.URL || record.Path != "/inspect/item" {
+		t.Fatalf("request record does not match sanitized request: %#v", record)
+	}
+	encoded, _ := json.Marshal(record)
+	for _, secret := range []string{"private-token", "private-cookie", "private-query"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatalf("request history leaked %q", secret)
 		}
 	}
 }

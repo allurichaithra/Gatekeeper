@@ -6,6 +6,9 @@ param(
   [string]$TrafficGatewayUrl = 'http://127.0.0.2:8080'
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'auth.ps1')
+$token = Get-GatekeeperAccessToken $ControlApiUrl
+$headers = @{ Authorization = "Bearer $token" }
 $burstSource = @'
 using System;
 using System.Net.Http;
@@ -30,7 +33,7 @@ public static class AdaptiveBurstRunner {
 }
 '@
 if (-not ('AdaptiveBurstRunner' -as [type])) { Add-Type -TypeDefinition $burstSource -ReferencedAssemblies 'System.Net.Http.dll' }
-$allRoutes = Invoke-RestMethod "$ControlApiUrl/api/routes"
+$allRoutes = Invoke-RestMethod "$ControlApiUrl/api/routes" -Headers $headers
 $route = $allRoutes | Where-Object { $_.id -eq $RouteId } | Select-Object -First 1
 $other = $allRoutes | Where-Object { $_.id -eq $OtherRouteId } | Select-Object -First 1
 if (-not $route -or -not $other) { throw 'RouteId and OtherRouteId must identify two existing routes.' }
@@ -43,17 +46,17 @@ function New-RoutePayload($source, $mode, $enabled) {
   }
 }
 function Publish-Route($payload) {
-  $result = Invoke-RestMethod "$ControlApiUrl/api/routes/$RouteId" -Method Put -ContentType 'application/json' -Body ($payload | ConvertTo-Json -Depth 8)
+  $result = Invoke-RestMethod "$ControlApiUrl/api/routes/$RouteId" -Headers $headers -Method Put -ContentType 'application/json' -Body ($payload | ConvertTo-Json -Depth 8)
   $deadline = [DateTime]::UtcNow.AddSeconds(10)
   do {
-    $active = Invoke-RestMethod "$GatewayUrl/health/config"
-    if ([int]$active.version -eq [int]$result.version) { return $active }
+    $active = (Invoke-RestMethod "$ControlApiUrl/api/gateways" -Headers $headers)[0]
+    if ([int]$active.currentVersion -eq [int]$result.version) { return $active }
     Start-Sleep -Milliseconds 100
   } while ([DateTime]::UtcNow -lt $deadline)
   throw "Gateway did not activate route configuration version $($result.version)."
 }
 function Read-AdaptiveRoute {
-  $payload = Invoke-RestMethod "$ControlApiUrl/api/gateway/adaptive"
+  $payload = Invoke-RestMethod "$ControlApiUrl/api/gateway/adaptive" -Headers $headers
   return $payload.routes | Where-Object { $_.routeId -eq $RouteId } | Select-Object -First 1
 }
 function Read-Status([string]$url) {
@@ -71,7 +74,7 @@ $original = @{
 }
 $path = $TrafficGatewayUrl.TrimEnd('/') + $route.path
 $fixedPath = $GatewayUrl.TrimEnd('/') + $route.path
-$startInfo = Invoke-RestMethod "$GatewayUrl/health/config"
+$startInfo = (Invoke-RestMethod "$ControlApiUrl/api/gateways" -Headers $headers)[0]
 $fixedPayload = New-RoutePayload $route 'FIXED' $false
 $adaptivePayload = New-RoutePayload $route 'ADAPTIVE' $true
 try {
@@ -103,9 +106,10 @@ try {
   }
   $otherStatus = Read-Status ($TrafficGatewayUrl.TrimEnd('/') + $other.path)
   if ($otherStatus -ne 200) { throw "Independent route failed during protection: HTTP $otherStatus" }
-  $versionNow = (Invoke-RestMethod "$GatewayUrl/health/config").version
+  $currentNode = (Invoke-RestMethod "$ControlApiUrl/api/gateways" -Headers $headers)[0]
+  $versionNow = $currentNode.currentVersion
   $sameProcess = $activation.startedAt -eq $startInfo.startedAt
-  if (-not $sameProcess -or [int]$versionNow -le [int]$startInfo.version) { throw 'Configuration did not reload in the same gateway process.' }
+  if (-not $sameProcess -or [int]$versionNow -le [int]$startInfo.currentVersion) { throw 'Configuration did not reload in the same gateway process.' }
 
   $recovery = @()
   for ($index = 0; $index -lt 7; $index++) {
@@ -120,7 +124,7 @@ try {
     Route=$route.path; FixedModeStatuses=($fixedStatuses -join ','); BaselineRps=[Math]::Round($warm.baselineRps,3)
     BurstRequests=15; BurstSuccesses=$burstSuccess; SpikeCount=$spiked.spikesDetected
     ReducedEffectiveLimit=$spiked.effectiveLimit; Throttled=$spiked.throttledRequests; RejectedStatus=$triggerStatus
-    OtherRouteStatus=$otherStatus; ConfigVersionBefore=$startInfo.version; ConfigVersionAfter=$versionNow
+    OtherRouteStatus=$otherStatus; ConfigVersionBefore=$startInfo.currentVersion; ConfigVersionAfter=$versionNow
     GatewayRestarted=(-not $sameProcess); RecoveryLimits=($recovery -join ' -> '); RecoveryReachedBase=$recoveryReachedBase
   } | Format-List
 } finally {

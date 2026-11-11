@@ -31,42 +31,65 @@ type Snapshot struct {
 
 // Route describes matching, rewriting, timeout, and target behavior.
 type Route struct {
-	ID                      string   `json:"id"`
-	Path                    string   `json:"path"`
-	MatchMode               string   `json:"matchMode"`
-	Methods                 []string `json:"methods"`
-	StripPrefix             bool     `json:"stripPrefix"`
-	RewritePrefix           string   `json:"rewritePrefix,omitempty"`
-	TimeoutMs               int      `json:"timeoutMs"`
-	Enabled                 bool     `json:"enabled"`
-	ServiceID               string   `json:"serviceId"`
-	Targets                 []Target `json:"targets"`
-	RateLimit               int      `json:"rateLimit,omitempty"` // requests per minute per client IP; zero disables
-	RateLimitMode           string   `json:"rateLimitMode,omitempty"`
-	AdaptiveEnabled         bool     `json:"adaptiveEnabled,omitempty"`
-	MinimumRateLimit        int      `json:"minimumRateLimit,omitempty"`
-	MaximumRateLimit        int      `json:"maximumRateLimit,omitempty"`
-	SpikeSensitivity        float64  `json:"spikeSensitivity,omitempty"`
-	RecoveryCooldownMs      int      `json:"recoveryCooldownMs,omitempty"`
-	ManualOverrideLimit     int      `json:"manualOverrideLimit,omitempty"`
-	ManualOverrideExpiresAt int64    `json:"manualOverrideExpiresAt,omitempty"`
-	CacheTtlMs              int      `json:"cacheTtlMs,omitempty"`
+	ID                       string        `json:"id"`
+	Path                     string        `json:"path"`
+	MatchMode                string        `json:"matchMode"`
+	Methods                  []string      `json:"methods"`
+	StripPrefix              bool          `json:"stripPrefix"`
+	RewritePrefix            string        `json:"rewritePrefix,omitempty"`
+	TimeoutMs                int           `json:"timeoutMs"`
+	Enabled                  bool          `json:"enabled"`
+	ServiceID                string        `json:"serviceId"`
+	Targets                  []Target      `json:"targets"`
+	UpstreamGroups           []TargetGroup `json:"upstreamGroups,omitempty"`
+	RateLimit                int           `json:"rateLimit,omitempty"` // requests per minute per client IP; zero disables
+	RateLimitMode            string        `json:"rateLimitMode,omitempty"`
+	AdaptiveEnabled          bool          `json:"adaptiveEnabled,omitempty"`
+	MinimumRateLimit         int           `json:"minimumRateLimit,omitempty"`
+	MaximumRateLimit         int           `json:"maximumRateLimit,omitempty"`
+	SpikeSensitivity         float64       `json:"spikeSensitivity,omitempty"`
+	RecoveryCooldownMs       int           `json:"recoveryCooldownMs,omitempty"`
+	ManualOverrideLimit      int           `json:"manualOverrideLimit,omitempty"`
+	ManualOverrideExpiresAt  int64         `json:"manualOverrideExpiresAt,omitempty"`
+	CacheTtlMs               int           `json:"cacheTtlMs,omitempty"`
+	LoadBalancingAlgorithm   string        `json:"loadBalancingAlgorithm,omitempty"`
+	CircuitBreakerEnabled    bool          `json:"circuitBreakerEnabled,omitempty"`
+	CircuitFailureThreshold  int           `json:"circuitFailureThreshold,omitempty"`
+	CircuitRecoveryTimeoutMs int           `json:"circuitRecoveryTimeoutMs,omitempty"`
+	CircuitHalfOpenProbes    int           `json:"circuitHalfOpenProbes,omitempty"`
+	MaxRetries               int           `json:"maxRetries,omitempty"`
+	RetryBackoffMs           int           `json:"retryBackoffMs,omitempty"`
+	RetryMaxBackoffMs        int           `json:"retryMaxBackoffMs,omitempty"`
+	RetryJitter              bool          `json:"retryJitter,omitempty"`
+	RetryStatuses            []int         `json:"retryStatuses,omitempty"`
+	RetryConnectionErrors    bool          `json:"retryConnectionErrors,omitempty"`
+	RetryTimeouts            bool          `json:"retryTimeouts,omitempty"`
+	RetryNonIdempotent       bool          `json:"retryNonIdempotent,omitempty"`
 }
 
 // Target is a backend instance for a service.
 type Target struct {
-	URL    string `json:"url"`
-	Weight int    `json:"weight"`
+	URL     string `json:"url"`
+	Weight  int    `json:"weight"`
+	GroupID string `json:"groupId,omitempty"`
+}
+
+type TargetGroup struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Percentage int      `json:"percentage"`
+	Targets    []Target `json:"targets"`
 }
 
 // Manager validates, persists, and atomically activates gateway snapshots.
 type Manager struct {
-	current    atomic.Pointer[Snapshot]
-	configFile string
-	backupFile string
-	sequence   sync.Map
-	applyMu    sync.Mutex
-	state      *runtimeState
+	current       atomic.Pointer[Snapshot]
+	configFile    string
+	backupFile    string
+	sequence      sync.Map
+	groupSequence sync.Map
+	applyMu       sync.Mutex
+	state         *runtimeState
 }
 
 type runtimeState struct {
@@ -90,7 +113,34 @@ type runtimeState struct {
 	throttled            map[string]uint64
 	decisionCount        uint64
 	clientHitCount       int
+	upstreams            map[string]*upstreamRuntime
+	retries              atomic.Uint64
+	retrySuccesses       atomic.Uint64
+	retryExhausted       atomic.Uint64
+	circuitOpenRejects   atomic.Uint64
+	circuitEvents        []CircuitEvent
+	requestsHistory      []RequestRecord
 }
+
+// RequestRecord contains bounded, sanitized request metadata. It never stores headers or bodies.
+type RequestRecord struct {
+	Timestamp          time.Time `json:"timestamp"`
+	RequestID          string    `json:"requestId"`
+	Method             string    `json:"method"`
+	Path               string    `json:"path"`
+	RouteID            string    `json:"routeId,omitempty"`
+	Upstream           string    `json:"upstream,omitempty"`
+	GroupID            string    `json:"groupId,omitempty"`
+	Status             int       `json:"status"`
+	DurationMs         float64   `json:"durationMs"`
+	Cache              string    `json:"cache"`
+	RetryCount         int       `json:"retryCount"`
+	CircuitDecision    string    `json:"circuitDecision"`
+	RateLimitDecision  string    `json:"rateLimitDecision"`
+	UpstreamDurationMs float64   `json:"upstreamDurationMs"`
+}
+
+const maxRequestRecords = 1000
 
 type metricBucket struct {
 	second       int64
@@ -125,7 +175,7 @@ type combinedReadCloser struct {
 func (r *combinedReadCloser) Close() error { return r.closer.Close() }
 
 func NewManager(configFile string) (*Manager, error) {
-	manager := &Manager{configFile: configFile, backupFile: configFile + ".last-good", state: &runtimeState{clients: map[string][]time.Time{}, cache: map[string]cacheEntry{}, probes: map[string]bool{}, statusCodes: map[int]uint64{}, adaptive: map[string]*adaptiveRouteState{}, throttled: map[string]uint64{}, started: time.Now()}}
+	manager := &Manager{configFile: configFile, backupFile: configFile + ".last-good", state: &runtimeState{clients: map[string][]time.Time{}, cache: map[string]cacheEntry{}, probes: map[string]bool{}, statusCodes: map[int]uint64{}, adaptive: map[string]*adaptiveRouteState{}, throttled: map[string]uint64{}, upstreams: map[string]*upstreamRuntime{}, started: time.Now()}}
 	empty := Snapshot{Version: "0", Routes: []Route{}}
 	if configFile != "" {
 		data, err := os.ReadFile(configFile)
@@ -206,6 +256,29 @@ func (m *Manager) Metrics() map[string]any {
 		statusCodes[strconv.Itoa(status)] = count
 	}
 	points := make([]metricPoint, 0, 60)
+	latencies := make([]float64, 0, len(m.state.requestsHistory))
+	routeTraffic := make(map[string]uint64)
+	routeErrors := make(map[string]uint64)
+	for _, request := range m.state.requestsHistory {
+		latencies = append(latencies, request.DurationMs)
+		if request.RouteID != "" {
+			routeTraffic[request.RouteID]++
+			if request.Status >= 500 {
+				routeErrors[request.RouteID]++
+			}
+		}
+	}
+	sort.Float64s(latencies)
+	percentile := func(p float64) float64 {
+		if len(latencies) == 0 {
+			return 0
+		}
+		index := int(math.Ceil(p*float64(len(latencies)))) - 1
+		if index < 0 {
+			index = 0
+		}
+		return latencies[index]
+	}
 	var recentRequests uint64
 	for second := nowSecond - 59; second <= nowSecond; second++ {
 		bucket := m.state.buckets[second%int64(len(m.state.buckets))]
@@ -233,7 +306,83 @@ func (m *Manager) Metrics() map[string]any {
 		windowSeconds = 0.001
 	}
 	rps := float64(recentRequests) / windowSeconds
-	return map[string]any{"totalRequests": requests, "requestsPerSecond": rps, "averageResponseMs": averageResponseMs, "errors": failures, "errorRate": errorRate, "clientErrors": clientErrors, "expectedClientErrors": expectedClientErrors, "clientErrorRate": clientErrorRate, "statusCodes": statusCodes, "cacheHits": cacheHits, "cacheMisses": cacheMisses, "cacheHitRate": cacheHitRate, "timeseries": points, "uptimeSeconds": int64(time.Since(m.state.started).Seconds()), "configVersion": m.Current().Version}
+	return map[string]any{"totalRequests": requests, "requestsPerSecond": rps, "averageResponseMs": averageResponseMs, "p50ResponseMs": percentile(.50), "p95ResponseMs": percentile(.95), "p99ResponseMs": percentile(.99), "routeTraffic": routeTraffic, "routeErrors": routeErrors, "errors": failures, "errorRate": errorRate, "clientErrors": clientErrors, "expectedClientErrors": expectedClientErrors, "clientErrorRate": clientErrorRate, "statusCodes": statusCodes, "cacheHits": cacheHits, "cacheMisses": cacheMisses, "cacheHitRate": cacheHitRate, "timeseries": points, "uptimeSeconds": int64(time.Since(m.state.started).Seconds()), "configVersion": m.Current().Version, "retryAttempts": m.state.retries.Load(), "retrySuccesses": m.state.retrySuccesses.Load(), "retryExhausted": m.state.retryExhausted.Load(), "circuitOpenRejections": m.state.circuitOpenRejects.Load(), "upstreams": m.UpstreamTelemetry()}
+}
+
+func (m *Manager) RequestHistory(filters map[string]string, limit int) []RequestRecord {
+	if limit < 1 || limit > 200 {
+		limit = 100
+	}
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	result := make([]RequestRecord, 0, limit)
+	for i := len(m.state.requestsHistory) - 1; i >= 0 && len(result) < limit; i-- {
+		item := m.state.requestsHistory[i]
+		if value := filters["requestId"]; value != "" && !strings.Contains(item.RequestID, value) {
+			continue
+		}
+		if value := filters["route"]; value != "" && item.RouteID != value {
+			continue
+		}
+		if value := filters["upstream"]; value != "" && !strings.Contains(item.Upstream, value) {
+			continue
+		}
+		if value := filters["status"]; value != "" && strconv.Itoa(item.Status) != value {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func (m *Manager) RequestByID(id string) (RequestRecord, bool) {
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	for i := len(m.state.requestsHistory) - 1; i >= 0; i-- {
+		if m.state.requestsHistory[i].RequestID == id {
+			return m.state.requestsHistory[i], true
+		}
+	}
+	return RequestRecord{}, false
+}
+
+func (m *Manager) circuitState(routeID, target string) string {
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	if runtime := m.state.upstreams[upstreamKey(routeID, target)]; runtime != nil {
+		return runtime.state
+	}
+	return circuitClosed
+}
+
+func (m *Manager) UpstreamTelemetry() map[string]any {
+	snapshot := m.Current()
+	items := make([]map[string]any, 0)
+	m.state.mu.Lock()
+	defer m.state.mu.Unlock()
+	for _, route := range snapshot.Routes {
+		for _, target := range route.Targets {
+			runtime := m.upstreamLocked(route.ID, target.URL)
+			var lastTransition any
+			if !runtime.lastTransition.IsZero() {
+				lastTransition = runtime.lastTransition
+			}
+			failureRate := float64(0)
+			if runtime.requests > 0 {
+				failureRate = float64(runtime.failureCount) / float64(runtime.requests)
+			}
+			items = append(items, map[string]any{"routeId": route.ID, "serviceId": route.ServiceID, "upstream": target.URL, "algorithm": normalizedAlgorithm(route.LoadBalancingAlgorithm), "circuitState": runtime.state, "requests": runtime.requests, "failures": runtime.failureCount, "failureRate": failureRate, "consecutiveFailures": runtime.failures, "activeConnections": runtime.active, "averageResponseMs": float64(runtime.avgLatencyNs) / float64(time.Millisecond), "lastTransition": lastTransition})
+		}
+	}
+	events := append([]CircuitEvent(nil), m.state.circuitEvents...)
+	return map[string]any{"upstreams": items, "circuitEvents": events}
+}
+
+func normalizedAlgorithm(value string) string {
+	if value == "" {
+		return "WEIGHTED_ROUND_ROBIN"
+	}
+	return strings.ToUpper(value)
 }
 
 func (m *Manager) recordRequestStart(started time.Time) {
@@ -382,6 +531,12 @@ func (m *Manager) pruneRuntime(snapshot, previous *Snapshot) {
 		}
 		return true
 	})
+	m.groupSequence.Range(func(key, value any) bool {
+		if _, ok := validRoutes[key.(string)]; !ok {
+			m.groupSequence.Delete(key)
+		}
+		return true
+	})
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
 	previousRoutes := make(map[string]Route, len(previous.Routes))
@@ -407,6 +562,11 @@ func (m *Manager) pruneRuntime(snapshot, previous *Snapshot) {
 			delete(m.state.probes, key)
 		}
 	}
+	for key := range m.state.upstreams {
+		if _, ok := validTargets[key]; !ok {
+			delete(m.state.upstreams, key)
+		}
+	}
 	for key := range m.state.adaptive {
 		if _, ok := validRoutes[key]; !ok {
 			delete(m.state.adaptive, key)
@@ -414,8 +574,17 @@ func (m *Manager) pruneRuntime(snapshot, previous *Snapshot) {
 		}
 	}
 	for _, route := range snapshot.Routes {
-		if old, exists := previousRoutes[route.ID]; exists && adaptiveConfigChanged(old, route) {
-			delete(m.state.adaptive, route.ID)
+		if old, exists := previousRoutes[route.ID]; exists {
+			if adaptiveConfigChanged(old, route) {
+				delete(m.state.adaptive, route.ID)
+			}
+			if reliabilityConfigChanged(old, route) {
+				for key := range m.state.upstreams {
+					if strings.HasPrefix(key, route.ID+"|") {
+						delete(m.state.upstreams, key)
+					}
+				}
+			}
 		}
 		state := m.state.adaptive[route.ID]
 		oldLimit, oldExpiry := 0, int64(0)
@@ -444,6 +613,22 @@ func (m *Manager) pruneRuntime(snapshot, previous *Snapshot) {
 
 func adaptiveConfigChanged(a, b Route) bool {
 	return a.RateLimit != b.RateLimit || a.RateLimitMode != b.RateLimitMode || a.AdaptiveEnabled != b.AdaptiveEnabled || a.MinimumRateLimit != b.MinimumRateLimit || a.MaximumRateLimit != b.MaximumRateLimit || a.SpikeSensitivity != b.SpikeSensitivity || a.RecoveryCooldownMs != b.RecoveryCooldownMs
+}
+
+func reliabilityConfigChanged(a, b Route) bool {
+	return a.LoadBalancingAlgorithm != b.LoadBalancingAlgorithm || a.CircuitBreakerEnabled != b.CircuitBreakerEnabled || a.CircuitFailureThreshold != b.CircuitFailureThreshold || a.CircuitRecoveryTimeoutMs != b.CircuitRecoveryTimeoutMs || a.CircuitHalfOpenProbes != b.CircuitHalfOpenProbes || a.MaxRetries != b.MaxRetries || a.RetryBackoffMs != b.RetryBackoffMs || a.RetryMaxBackoffMs != b.RetryMaxBackoffMs || a.RetryJitter != b.RetryJitter || a.RetryConnectionErrors != b.RetryConnectionErrors || a.RetryTimeouts != b.RetryTimeouts || a.RetryNonIdempotent != b.RetryNonIdempotent || !equalInts(a.RetryStatuses, b.RetryStatuses)
+}
+
+func equalInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func ValidateSnapshot(snapshot Snapshot) error {
@@ -508,6 +693,41 @@ func ValidateSnapshot(snapshot Snapshot) error {
 		if route.RecoveryCooldownMs != 0 && (route.RecoveryCooldownMs < 1000 || route.RecoveryCooldownMs > 3600000) {
 			return fmt.Errorf("route %q recoveryCooldownMs must be between 1000 and 3600000", route.ID)
 		}
+		if route.LoadBalancingAlgorithm == "" {
+			route.LoadBalancingAlgorithm = "WEIGHTED_ROUND_ROBIN"
+		}
+		route.LoadBalancingAlgorithm = strings.ToUpper(route.LoadBalancingAlgorithm)
+		if route.LoadBalancingAlgorithm != "ROUND_ROBIN" && route.LoadBalancingAlgorithm != "WEIGHTED_ROUND_ROBIN" && route.LoadBalancingAlgorithm != "LEAST_CONNECTIONS" && route.LoadBalancingAlgorithm != "LEAST_RESPONSE_TIME" {
+			return fmt.Errorf("route %q has unsupported loadBalancingAlgorithm", route.ID)
+		}
+		if route.CircuitFailureThreshold == 0 {
+			route.CircuitFailureThreshold = 5
+		}
+		if route.CircuitRecoveryTimeoutMs == 0 {
+			route.CircuitRecoveryTimeoutMs = 30000
+		}
+		if route.CircuitHalfOpenProbes == 0 {
+			route.CircuitHalfOpenProbes = 1
+		}
+		if route.CircuitFailureThreshold < 1 || route.CircuitFailureThreshold > 1000 || route.CircuitRecoveryTimeoutMs < 100 || route.CircuitRecoveryTimeoutMs > 3600000 || route.CircuitHalfOpenProbes < 1 || route.CircuitHalfOpenProbes > 100 {
+			return fmt.Errorf("route %q has invalid circuit breaker configuration", route.ID)
+		}
+		if route.MaxRetries < 0 || route.MaxRetries > 5 || route.RetryBackoffMs < 0 || route.RetryBackoffMs > 30000 || route.MaxRetries > 0 && route.RetryBackoffMs < 1 || route.RetryMaxBackoffMs < 0 || route.RetryMaxBackoffMs > 300000 || route.RetryMaxBackoffMs > 0 && route.RetryMaxBackoffMs < route.RetryBackoffMs {
+			return fmt.Errorf("route %q has invalid retry configuration", route.ID)
+		}
+		if route.RetryMaxBackoffMs == 0 {
+			route.RetryMaxBackoffMs = 1000
+		}
+		statusSet := map[int]struct{}{}
+		for _, status := range route.RetryStatuses {
+			if status < 500 || status > 599 {
+				return fmt.Errorf("route %q retry statuses must be server errors between 500 and 599", route.ID)
+			}
+			if _, exists := statusSet[status]; exists {
+				return fmt.Errorf("route %q contains duplicate retry status", route.ID)
+			}
+			statusSet[status] = struct{}{}
+		}
 		if route.ManualOverrideLimit < 0 || route.ManualOverrideLimit > 1000000 || route.ManualOverrideLimit > 0 && route.RateLimit > 0 && (route.ManualOverrideLimit < minimum || route.ManualOverrideLimit > maximum) {
 			return fmt.Errorf("route %q manual override is outside its adaptive bounds", route.ID)
 		}
@@ -521,8 +741,46 @@ func ValidateSnapshot(snapshot Snapshot) error {
 			}
 			methodSet[method] = struct{}{}
 		}
+		if len(route.UpstreamGroups) > 0 {
+			if len(route.UpstreamGroups) < 2 || len(route.UpstreamGroups) > 10 {
+				return fmt.Errorf("route %q must contain 2 to 10 upstream groups", route.ID)
+			}
+			seenGroups := map[string]struct{}{}
+			percentageTotal, activeGroups := 0, 0
+			flattened := make([]Target, 0)
+			for _, group := range route.UpstreamGroups {
+				if group.ID == "" || len(group.ID) > 32 || strings.ContainsAny(group.ID, " /\\?#") {
+					return fmt.Errorf("route %q has an invalid upstream group id", route.ID)
+				}
+				if _, exists := seenGroups[group.ID]; exists {
+					return fmt.Errorf("route %q has duplicate upstream group ids", route.ID)
+				}
+				seenGroups[group.ID] = struct{}{}
+				if strings.TrimSpace(group.Name) == "" || len(group.Name) > 64 || group.Percentage < 0 || group.Percentage > 100 || len(group.Targets) == 0 || len(group.Targets) > 100 {
+					return fmt.Errorf("route %q has invalid upstream group settings", route.ID)
+				}
+				percentageTotal += group.Percentage
+				if group.Percentage > 0 {
+					activeGroups++
+				}
+				for _, target := range group.Targets {
+					target.GroupID = group.ID
+					flattened = append(flattened, target)
+				}
+			}
+			if percentageTotal != 100 || activeGroups == 0 {
+				return fmt.Errorf("route %q upstream group percentages must total 100", route.ID)
+			}
+			if len(flattened) > 100 {
+				return fmt.Errorf("route %q may have at most 100 total upstream instances", route.ID)
+			}
+			route.Targets = flattened
+		}
 		if len(route.Targets) == 0 {
 			return fmt.Errorf("route %q must have at least one target", route.ID)
+		}
+		if len(route.Targets) > 100 {
+			return fmt.Errorf("route %q may have at most 100 targets", route.ID)
 		}
 		for _, target := range route.Targets {
 			parsed, err := url.Parse(target.URL)
@@ -585,6 +843,8 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 		capture := &statusWriter{ResponseWriter: w}
 		w = capture
 		cacheLookup := 0
+		trace := &requestTrace{}
+		record := RequestRecord{Timestamp: started.UTC(), RequestID: r.Header.Get(requestIDHeader), Method: r.Method, Path: r.URL.Path, Cache: "BYPASS", RateLimitDecision: "NOT_CONFIGURED", CircuitDecision: "NOT_USED"}
 		m.recordRequestStart(started)
 		defer func() {
 			status := capture.status
@@ -592,6 +852,30 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 				status = http.StatusOK
 			}
 			m.recordRequestComplete(started, status, time.Since(started), cacheLookup)
+			record.Status = status
+			record.RetryCount = int(trace.retries.Load())
+			if record.Upstream == "" {
+				record.Upstream = trace.upstream
+			}
+			if record.GroupID == "" {
+				record.GroupID = trace.groupID
+			}
+			if trace.circuitDecision != "" {
+				record.CircuitDecision = trace.circuitDecision
+			}
+			record.UpstreamDurationMs = trace.upstreamDurationMs
+			record.DurationMs = float64(time.Since(started).Microseconds()) / 1000
+			if cacheLookup == 1 {
+				record.Cache = "HIT"
+			} else if cacheLookup == 2 {
+				record.Cache = "MISS"
+			}
+			m.state.mu.Lock()
+			m.state.requestsHistory = append(m.state.requestsHistory, record)
+			if len(m.state.requestsHistory) > maxRequestRecords {
+				m.state.requestsHistory = append([]RequestRecord(nil), m.state.requestsHistory[len(m.state.requestsHistory)-maxRequestRecords:]...)
+			}
+			m.state.mu.Unlock()
 		}()
 		route, pathMatch := lookup(m.current.Load(), r.URL.Path, r.Method)
 		if route == nil {
@@ -607,6 +891,7 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 			http.NotFound(w, r)
 			return
 		}
+		record.RouteID = route.ID
 		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if clientIP == "" {
 			clientIP = r.RemoteAddr
@@ -617,6 +902,7 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 			w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(decision.Remaining))
 			w.Header().Set("X-RateLimit-Mode", decision.Mode)
 			if !decision.Allowed {
+				record.RateLimitDecision = "REJECTED"
 				seconds := int(math.Ceil(decision.RetryAfter.Seconds()))
 				if seconds < 1 {
 					seconds = 1
@@ -627,6 +913,7 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": "rate_limit_exceeded", "message": "Route request limit exceeded; retry after the current window expires.", "routeId": route.ID, "retryAfterSeconds": seconds, "reason": decision.Reason, "baseLimit": decision.BaseLimit, "effectiveLimit": decision.EffectiveLimit, "remaining": decision.Remaining, "mode": decision.Mode})
 				return
 			}
+			record.RateLimitDecision = "ALLOWED"
 		}
 		cacheKey := route.ID + "|" + r.URL.RequestURI()
 		if r.Method == http.MethodGet && route.CacheTtlMs > 0 {
@@ -638,26 +925,59 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 						w.Header().Add(k, value)
 					}
 				}
+				w.Header().Set(requestIDHeader, r.Header.Get(requestIDHeader))
 				w.Header().Set("X-Cache", "HIT")
 				w.WriteHeader(entry.status)
 				_, _ = w.Write(entry.body)
 				return
 			}
 		}
-		target := m.pickTarget(*route)
+		groupRoutes := m.requestGroups(*route)
+		if len(groupRoutes) == 0 {
+			http.Error(w, "no configured upstream group", http.StatusBadGateway)
+			return
+		}
+		activeRoute := groupRoutes[0]
+		target := activeRoute.Targets[0]
 		parsed, _ := url.Parse(target.URL)
 		proxy := httputil.NewSingleHostReverseProxy(parsed)
-		proxy.Transport = timeoutRoundTripper{next: defaultTransport, timeout: time.Duration(route.TimeoutMs) * time.Millisecond}
+		maxRetries := route.MaxRetries
+		if !retryMethodAllowed(*route, r) {
+			maxRetries = 0
+		}
+		if maxRetries > 0 && r.Body != nil {
+			body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+			if readErr != nil {
+				http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		}
+		proxy.Transport = timeoutRoundTripper{next: retryRoundTripper{manager: m, route: activeRoute, fallbackRoutes: groupRoutes[1:], maxRetries: maxRetries, logger: logger, trace: trace}, timeout: time.Duration(route.TimeoutMs) * time.Millisecond}
 		proxy.Director = func(out *http.Request) {
 			out.URL.Scheme = parsed.Scheme
 			out.URL.Host = parsed.Host
 			out.Host = parsed.Host
-			out.URL.Path = joinURLPath(parsed.Path, rewritePath(r.URL.Path, *route))
+			out.URL.Path = rewritePath(r.URL.Path, *route)
 			out.URL.RawPath = ""
 			out.URL.RawQuery = r.URL.RawQuery
 		}
 		proxy.ModifyResponse = func(response *http.Response) error {
-			m.markTarget(route.ID, target.URL, true)
+			m.markTarget(route.ID, response.Header.Get("X-Gateway-Upstream"), true)
+			record.Upstream = response.Header.Get("X-Gateway-Upstream")
+			record.GroupID = response.Header.Get("X-Gateway-Group")
+			m.state.mu.Lock()
+			if runtime := m.state.upstreams[upstreamKey(route.ID, record.Upstream)]; runtime != nil {
+				record.CircuitDecision = runtime.state
+			}
+			m.state.mu.Unlock()
+			record.RetryCount, _ = strconv.Atoi(response.Header.Get("X-Gateway-Retries"))
+			record.UpstreamDurationMs, _ = strconv.ParseFloat(response.Header.Get("X-Gateway-Upstream-Duration-Ms"), 64)
+			response.Header.Del("X-Gateway-Retries")
+			response.Header.Del("X-Gateway-Upstream-Duration-Ms")
+			response.Header.Del("X-Gateway-Group")
+			response.Header.Del("X-Gateway-Upstream")
 			response.Header.Set(requestIDHeader, r.Header.Get(requestIDHeader))
 			if r.Method == http.MethodGet && route.CacheTtlMs > 0 && response.StatusCode >= 200 && response.StatusCode < 300 && len(response.Header.Values("Set-Cookie")) == 0 && response.Body != nil {
 				body, err := io.ReadAll(io.LimitReader(response.Body, (2<<20)+1))
@@ -676,7 +996,6 @@ func (m *Manager) Handler(globalTimeout time.Duration, logger *slog.Logger) http
 			return nil
 		}
 		proxy.ErrorHandler = func(response http.ResponseWriter, request *http.Request, err error) {
-			m.markTarget(route.ID, target.URL, false)
 			status, failure := http.StatusBadGateway, "backend_connection_failed"
 			var networkError interface{ Timeout() bool }
 			if errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError) && networkError.Timeout() {
@@ -812,40 +1131,6 @@ func contains(values []string, value string) bool {
 		}
 	}
 	return false
-}
-
-func (m *Manager) pickTarget(route Route) Target {
-	var total uint64
-	for _, target := range route.Targets {
-		total += uint64(target.Weight)
-	}
-	value, _ := m.sequence.LoadOrStore(route.ID, &atomic.Uint64{})
-	selected := value.(*atomic.Uint64).Add(1) % total
-	var chosen Target
-	chosenIndex := 0
-	for index, target := range route.Targets {
-		if selected < uint64(target.Weight) {
-			chosen = target
-			chosenIndex = index
-			break
-		}
-		selected -= uint64(target.Weight)
-	}
-	if chosen.URL == "" {
-		chosen = route.Targets[0]
-	}
-	m.state.mu.Lock()
-	defer m.state.mu.Unlock()
-	if failed, ok := m.state.probes[route.ID+"|"+chosen.URL]; ok && !failed {
-		for offset := 1; offset < len(route.Targets); offset++ {
-			candidate := route.Targets[(chosenIndex+offset)%len(route.Targets)]
-			if state, known := m.state.probes[route.ID+"|"+candidate.URL]; !known || state {
-				chosen = candidate
-				break
-			}
-		}
-	}
-	return chosen
 }
 
 func (m *Manager) markTarget(routeID, target string, healthy bool) {

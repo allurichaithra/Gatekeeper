@@ -160,6 +160,7 @@ func TestDisabledRouteAndRewrite(t *testing.T) {
 
 func TestRateLimitAndCache(t *testing.T) {
 	var hits atomic.Int32
+	var ids atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "text/plain")
@@ -178,16 +179,22 @@ func TestRateLimitAndCache(t *testing.T) {
 	handler := manager.Handler(time.Second, testLogger())
 	req := func(path, ip string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodGet, path, nil)
+		r.Header.Set(requestIDHeader, fmt.Sprintf("request-%d", ids.Add(1)))
 		r.RemoteAddr = ip
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, r)
 		return w
 	}
-	if got := req("/api/items", "127.0.0.1:1000"); got.Code != 200 || got.Header().Get("X-Cache") != "MISS" {
+	firstResponse := req("/api/items", "127.0.0.1:1000")
+	if got := firstResponse; got.Code != 200 || got.Header().Get("X-Cache") != "MISS" {
 		t.Fatalf("first response: %d cache=%q", got.Code, got.Header().Get("X-Cache"))
 	}
-	if got := req("/api/items", "127.0.0.1:1000"); got.Code != 200 || got.Header().Get("X-Cache") != "HIT" {
+	secondResponse := req("/api/items", "127.0.0.1:1000")
+	if got := secondResponse; got.Code != 200 || got.Header().Get("X-Cache") != "HIT" {
 		t.Fatalf("cached response: %d cache=%q", got.Code, got.Header().Get("X-Cache"))
+	}
+	if firstResponse.Header().Get(requestIDHeader) != "request-1" || secondResponse.Header().Get(requestIDHeader) != "request-2" {
+		t.Fatalf("request IDs changed or were reused across cache: first=%q second=%q", firstResponse.Header().Get(requestIDHeader), secondResponse.Header().Get(requestIDHeader))
 	}
 	blocked := req("/api/items", "127.0.0.1:1000")
 	if blocked.Code != http.StatusTooManyRequests || blocked.Header().Get("Retry-After") == "" || !strings.Contains(blocked.Header().Get("Content-Type"), "application/json") {

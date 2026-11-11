@@ -28,6 +28,8 @@ test('JWT tokens reject expiry, tampering and invalid signatures', () => {
   });
   assert.equal(verifyAccessToken(token, secret, now).role, 'ADMIN');
   assert.throws(() => verifyAccessToken(token, secret, now + ACCESS_TOKEN_SECONDS * 1000));
-  assert.throws(() => verifyAccessToken(`${token.slice(0, -1)}x`, secret, now));
+  const [header, payload, signature] = token.split('.');
+  const changedSignature = `${signature[0] === 'A' ? 'B' : 'A'}${signature.slice(1)}`;
+  assert.throws(() => verifyAccessToken(`${header}.${payload}.${changedSignature}`, secret, now));
   assert.throws(() => verifyAccessToken(token, 'another-secret-that-is-long-enough', now));
 });

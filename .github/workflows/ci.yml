@@ -1,0 +1,64 @@
+name: Gatekeeper CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: services/gateway/go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Verify Go gateway
+        run: |
+          $gofmt = gofmt -l services/gateway
+          if ($gofmt) { Write-Error "Go files need gofmt: $gofmt"; exit 1 }
+          go -C services/gateway test ./...
+          go -C services/gateway vet ./...
+
+      - name: Verify formatting and PowerShell syntax
+        shell: pwsh
+        run: |
+          npm run format:check
+          $files = Get-ChildItem -Path scripts,tests -Filter *.ps1 -Recurse
+          foreach ($file in $files) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { $errors | ForEach-Object { Write-Error "$($file.FullName): $_" }; exit 1 }
+          }
+
+      - name: Verify control API and sample services
+        run: |
+          npm run test:control-api
+          npm run test:sample-services
+          npm run lint --workspace @gatekeeper/control-plane
+          npm run typecheck --workspace @gatekeeper/control-plane
+
+      - name: Verify dashboard
+        run: |
+          npm run lint --workspace @gatekeeper/dashboard
+          npm run typecheck --workspace @gatekeeper/dashboard
+          npm run build --workspace @gatekeeper/dashboard
+
+      - name: Run isolated Windows integration suite
+        shell: pwsh
+        run: ./scripts/test-integration.ps1

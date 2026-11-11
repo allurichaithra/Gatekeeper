@@ -22,7 +22,27 @@ type Route = {
   manualOverrideLimit?: number;
   manualOverrideExpiresAt?: number;
   cacheTtlMs?: number;
+  loadBalancingAlgorithm?:
+    'ROUND_ROBIN' | 'WEIGHTED_ROUND_ROBIN' | 'LEAST_CONNECTIONS' | 'LEAST_RESPONSE_TIME';
+  circuitBreakerEnabled?: boolean;
+  circuitFailureThreshold?: number;
+  circuitRecoveryTimeoutMs?: number;
+  circuitHalfOpenProbes?: number;
+  maxRetries?: number;
+  retryBackoffMs?: number;
+  retryMaxBackoffMs?: number;
+  retryJitter?: boolean;
+  retryStatuses?: number[];
+  retryConnectionErrors?: boolean;
+  retryTimeouts?: boolean;
+  retryNonIdempotent?: boolean;
   enabled: boolean;
+  upstreamGroups?: {
+    id: string;
+    name: string;
+    percentage: number;
+    targets: { url: string; weight: number }[];
+  }[];
   serviceId: string;
   service: Service;
 };
@@ -47,15 +67,48 @@ type Metrics = {
   totalRequests: number;
   requestsPerSecond: number;
   averageResponseMs: number;
+  p50ResponseMs: number;
+  p95ResponseMs: number;
+  p99ResponseMs: number;
   errors: number;
   errorRate: number;
   clientErrors: number;
   expectedClientErrors: number;
+  routeTraffic: Record<string, number>;
+  routeErrors: Record<string, number>;
   cacheHits: number;
   cacheMisses: number;
   cacheHitRate: number;
   statusCodes: Record<string, number>;
   timeseries: MetricPoint[];
+  retryAttempts: number;
+  retrySuccesses: number;
+  retryExhausted: number;
+  circuitOpenRejections: number;
+  upstreams: { upstreams: UpstreamReliability[]; circuitEvents: CircuitEvent[] };
+};
+type UpstreamReliability = {
+  routeId: string;
+  serviceId: string;
+  upstream: string;
+  algorithm: string;
+  circuitState: 'CLOSED' | 'OPEN' | 'HALF-OPEN';
+  failures: number;
+  requests: number;
+  failureRate: number;
+  consecutiveFailures: number;
+  activeConnections: number;
+  averageResponseMs: number;
+  lastTransition: string | null;
+};
+type CircuitEvent = {
+  at: string;
+  routeId: string;
+  upstream: string;
+  from: string;
+  to: string;
+  failures: number;
+  reason: string;
 };
 type AdaptivePoint = {
   timestamp: number;
@@ -491,14 +544,19 @@ function App() {
     ['routes', 'Routes'],
     ['analytics', 'Traffic Analytics'],
     ['health', 'Gateway Health'],
+    ['circuits', 'Circuit Breakers'],
+    ['alerts', 'Analytics & Alerts'],
+    ['config-history', 'Configuration History'],
+    ['inspector', 'Request Inspector'],
     ['settings', 'Settings'],
   ];
   if (isAdmin) navigation.splice(2, 0, ['upstreams', 'Upstreams']);
   if (isAdmin)
     navigation.push(
-      ['adaptive', 'Adaptive Protection'],
+      ['canary', 'Canary Deployments'],
+      ['adaptive', 'Rate Limiting'],
       ['gateways', 'Gateway nodes'],
-      ['access', 'Access Control'],
+      ['access', 'User Management'],
       ['audit', 'Audit log'],
     );
 
@@ -587,13 +645,14 @@ function App() {
             )}
             {page === 'gateways' && <Gateways gateways={gateways} api={api} run={withAction} />}
             {page === 'analytics' && <AnalyticsPanel routes={routes} api={api} />}
-            {page === 'health' && (
-              <LivePanel
-                title="Gateway and backend health"
-                endpoint="/api/gateway/health"
-                api={api}
-              />
+            {page === 'config-history' && (
+              <ConfigurationHistory api={api} run={withAction} readOnly={!isAdmin} />
             )}
+            {page === 'canary' && <CanaryDeployments routes={routes} api={api} run={withAction} />}
+            {page === 'inspector' && <RequestInspector api={api} />}
+            {page === 'alerts' && <AlertsPage routes={routes} api={api} readOnly={!isAdmin} />}
+            {page === 'health' && <ReliabilityPanel api={api} />}
+            {page === 'circuits' && <ReliabilityPanel api={api} />}
             {page === 'adaptive' && (
               <AdaptiveDashboard routes={routes} api={api} run={withAction} />
             )}
@@ -610,6 +669,721 @@ function App() {
         </footer>
       </main>
     </div>
+  );
+}
+
+type ConfigVersion = {
+  version: number;
+  actorUsername: string;
+  summary: string;
+  rollbackOf: number | null;
+  createdAt: number;
+  active: boolean;
+};
+function ConfigurationHistory({
+  api,
+  run,
+  readOnly,
+}: {
+  api: <T>(path: string, init?: RequestInit) => Promise<T>;
+  run: (fn: () => Promise<void>) => Promise<void>;
+  readOnly: boolean;
+}) {
+  const [versions, setVersions] = useState<ConfigVersion[]>([]);
+  const [activeVersion, setActiveVersion] = useState(0);
+  const [detail, setDetail] = useState<unknown>(null);
+  const [comparison, setComparison] = useState<unknown>(null);
+  const [error, setError] = useState('');
+  const load = useCallback(
+    () =>
+      api<{ activeVersion: number; versions: ConfigVersion[] }>('/api/config/history')
+        .then((data) => {
+          setVersions(data.versions);
+          setActiveVersion(data.activeVersion);
+        })
+        .catch((e: Error) => setError(e.message)),
+    [api],
+  );
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 10000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <h2>Configuration versions</h2>
+          <p>Validated snapshots persisted with the administrator and change summary.</p>
+        </div>
+      </div>
+      {error && <div className="alert error">{error}</div>}
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Version</th>
+              <th>Created</th>
+              <th>Administrator</th>
+              <th>Summary</th>
+              <th>Status</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {versions.map((v) => (
+              <tr key={v.version}>
+                <td>v{v.version}</td>
+                <td>{new Date(v.createdAt).toLocaleString()}</td>
+                <td>{v.actorUsername}</td>
+                <td>{v.summary}</td>
+                <td>
+                  {v.version === activeVersion
+                    ? 'Active'
+                    : v.rollbackOf != null
+                      ? `Rollback of v${v.rollbackOf}`
+                      : 'Inactive'}
+                </td>
+                <td>
+                  <button
+                    className="secondary small"
+                    onClick={() =>
+                      void api(`/api/config/history/${v.version}`)
+                        .then(setDetail)
+                        .catch((e: Error) => setError(e.message))
+                    }
+                  >
+                    View
+                  </button>{' '}
+                  <button
+                    className="secondary small"
+                    onClick={() =>
+                      void api(`/api/config/history/compare?from=${activeVersion}&to=${v.version}`)
+                        .then(setComparison)
+                        .catch((e: Error) => setError(e.message))
+                    }
+                  >
+                    Compare
+                  </button>{' '}
+                  {!readOnly && v.version !== activeVersion && (
+                    <button
+                      className="danger small"
+                      onClick={() => {
+                        if (window.confirm(`Roll back to configuration v${v.version}?`))
+                          void run(async () => {
+                            await api(`/api/config/rollback/${v.version}`, { method: 'POST' });
+                            await load();
+                          });
+                      }}
+                    >
+                      Rollback
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {detail !== null && <pre className="json-detail">{JSON.stringify(detail, null, 2)}</pre>}
+      {comparison !== null && (
+        <pre className="json-detail">{JSON.stringify(comparison, null, 2)}</pre>
+      )}
+      {versions.length === 0 && (
+        <div className="empty">No configuration versions have been published.</div>
+      )}
+    </section>
+  );
+}
+
+function CanaryDeployments({
+  routes,
+  api,
+  run,
+}: {
+  routes: Route[];
+  api: <T>(path: string, init?: RequestInit) => Promise<T>;
+  run: (fn: () => Promise<void>) => Promise<void>;
+}) {
+  const [percentages, setPercentages] = useState<Record<string, number>>({});
+  const [selectedUpstream, setSelectedUpstream] = useState<Record<string, string>>({});
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [requestRecords, setRequestRecords] = useState<InspectedRequest[]>([]);
+  useEffect(() => {
+    const load = () =>
+      void Promise.all([
+        api<Metrics>('/api/gateway/metrics'),
+        api<InspectedRequest[]>('/api/gateway/requests?limit=200'),
+      ])
+        .then(([live, requests]) => {
+          setMetrics(live);
+          setRequestRecords(requests);
+        })
+        .catch(() => {});
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => window.clearInterval(timer);
+  }, [api]);
+  const save = (route: Route, canaryPct: number, promote = false, rollback = false) =>
+    run(async () => {
+      const registered =
+        route.service?.upstreams
+          ?.filter((u) => u.enabled)
+          .map(({ url, weight }) => ({ url, weight })) ?? [];
+      const canaryUrl =
+        selectedUpstream[route.id] ??
+        route.upstreamGroups?.find((group) => group.id === 'canary')?.targets[0]?.url ??
+        registered[1]?.url;
+      const canary = registered.filter((target) => target.url === canaryUrl);
+      const stable =
+        route.upstreamGroups?.find((group) => group.id === 'stable')?.targets ??
+        registered.filter((target) => target.url !== canaryUrl);
+      if (
+        !stable.length ||
+        !canary.length ||
+        stable.some((target) => canary.some((candidate) => candidate.url === target.url))
+      )
+        throw new Error(
+          'Register at least two distinct enabled upstream instances, then choose one for canary traffic.',
+        );
+      const promoted =
+        route.upstreamGroups?.find((group) => group.id === 'stable')?.name ===
+        'Stable (promoted canary)';
+      const groups = promote
+        ? [
+            { id: 'stable', name: 'Stable (promoted canary)', percentage: 100, targets: canary },
+            { id: 'canary', name: 'Canary', percentage: 0, targets: stable },
+          ]
+        : rollback && promoted
+          ? [
+              { id: 'stable', name: 'Stable', percentage: 100, targets: canary },
+              { id: 'canary', name: 'Canary', percentage: 0, targets: stable },
+            ]
+          : [
+              { id: 'stable', name: 'Stable', percentage: 100 - canaryPct, targets: stable },
+              { id: 'canary', name: 'Canary', percentage: canaryPct, targets: canary },
+            ];
+      await api(`/api/routes/${route.id}`, {
+        method: 'PUT',
+        body: JSON.stringify({ ...route, upstreamGroups: groups }),
+      });
+      setPercentages((current) => {
+        const next = { ...current };
+        delete next[route.id];
+        return next;
+      });
+      setSelectedUpstream((current) => {
+        const next = { ...current };
+        delete next[route.id];
+        return next;
+      });
+    });
+  const routed = routes.filter((r) => r.upstreamGroups?.length);
+  return (
+    <>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Canary traffic splitting</h2>
+            <p>
+              Traffic is assigned deterministically by route. A group without healthy targets falls
+              back to the next healthy group.
+            </p>
+          </div>
+        </div>
+        {routes
+          .filter((r) => r.enabled)
+          .map((route) => {
+            const pct =
+              percentages[route.id] ??
+              route.upstreamGroups?.find((g) => g.id === 'canary')?.percentage ??
+              0;
+            const traffic =
+              metrics?.timeseries?.reduce((sum, point) => sum + point.requests, 0) ?? 0;
+            const groupStats = (groupId: string) => {
+              const records = requestRecords.filter(
+                (record) => record.routeId === route.id && record.groupId === groupId,
+              );
+              const errors = records.filter((record) => record.status >= 500).length;
+              const avg = records.length
+                ? records.reduce((sum, record) => sum + record.durationMs, 0) / records.length
+                : 0;
+              return `${records.length} requests · ${records.length ? ((errors / records.length) * 100).toFixed(1) : '0.0'}% errors · ${avg.toFixed(2)} ms avg`;
+            };
+            return (
+              <div className="canary-row" key={route.id}>
+                <div>
+                  <b>{route.path}</b>
+                  <small>
+                    {route.id} ·{' '}
+                    {route.upstreamGroups?.length
+                      ? pct === 0
+                        ? 'Stable only'
+                        : pct === 100
+                          ? 'Canary at 100%'
+                          : 'Active rollout'
+                      : 'No split configured'}{' '}
+                    · {traffic} gateway requests in current window
+                  </small>
+                  {route.upstreamGroups?.map((group) => (
+                    <small key={group.id}>
+                      {group.name} {group.percentage}%: {groupStats(group.id)}
+                    </small>
+                  ))}
+                </div>
+                <label>
+                  Canary upstream
+                  <select
+                    value={
+                      selectedUpstream[route.id] ??
+                      route.upstreamGroups?.find((group) => group.id === 'canary')?.targets[0]
+                        ?.url ??
+                      route.service?.upstreams?.filter((upstream) => upstream.enabled)[1]?.url ??
+                      ''
+                    }
+                    onChange={(event) =>
+                      setSelectedUpstream({ ...selectedUpstream, [route.id]: event.target.value })
+                    }
+                  >
+                    <option value="">Choose registered upstream</option>
+                    {route.service?.upstreams
+                      ?.filter((upstream) => upstream.enabled)
+                      .map((upstream) => (
+                        <option key={upstream.id} value={upstream.url}>
+                          {upstream.url}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+                <label>
+                  Canary %{' '}
+                  <input
+                    type="number"
+                    min="0"
+                    max="100"
+                    value={pct}
+                    onChange={(e) =>
+                      setPercentages({ ...percentages, [route.id]: Number(e.target.value) })
+                    }
+                  />
+                </label>
+                <button
+                  className="primary small"
+                  onClick={() => void save(route, Math.max(0, Math.min(100, pct)))}
+                >
+                  Apply split
+                </button>
+                <button
+                  className="secondary small"
+                  disabled={!route.upstreamGroups?.length}
+                  onClick={() => void save(route, 0, false, true)}
+                >
+                  Pause / stable only
+                </button>
+                <button
+                  className="secondary small"
+                  disabled={pct === 0}
+                  onClick={() => void save(route, 0, true)}
+                >
+                  Promote canary
+                </button>
+                <button className="secondary small" onClick={() => void save(route, 0)}>
+                  Rollback
+                </button>
+              </div>
+            );
+          })}
+        {!routes.length && (
+          <div className="empty">Create an enabled route before configuring canary traffic.</div>
+        )}
+      </section>
+      <section className="panel">
+        <h2>Group configuration</h2>
+        {routed.map((route) => (
+          <div key={route.id}>
+            <h3>{route.path}</h3>
+            <pre className="json-detail">{JSON.stringify(route.upstreamGroups, null, 2)}</pre>
+          </div>
+        ))}
+        {!routed.length && <div className="empty">No canary groups are configured.</div>}
+      </section>
+    </>
+  );
+}
+
+type InspectedRequest = {
+  timestamp: string;
+  requestId: string;
+  method: string;
+  path: string;
+  routeId?: string;
+  upstream?: string;
+  groupId?: string;
+  status: number;
+  durationMs: number;
+  cache: string;
+  retryCount?: number;
+  circuitDecision?: string;
+  rateLimitDecision?: string;
+  upstreamDurationMs?: number;
+};
+type AlertEntry = {
+  id: string;
+  kind: string;
+  message: string;
+  related: string | null;
+  active: boolean;
+  acknowledgedAt: number | null;
+  createdAt: number;
+  resolvedAt: number | null;
+};
+type AlertRules = { errorRate: number; p95LatencyMs: number; trafficSpikeMultiplier: number };
+function AlertsPage({
+  routes,
+  api,
+  readOnly,
+}: {
+  routes: Route[];
+  api: <T>(path: string, init?: RequestInit) => Promise<T>;
+  readOnly: boolean;
+}) {
+  const [data, setData] = useState<{ rules: AlertRules; alerts: AlertEntry[] } | null>(null);
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [error, setError] = useState('');
+  const load = useCallback(async () => {
+    try {
+      const [alerts, live] = await Promise.all([
+        api<{ rules: AlertRules; alerts: AlertEntry[] }>('/api/alerts'),
+        api<Metrics>('/api/gateway/metrics'),
+      ]);
+      setData(alerts);
+      setMetrics(live);
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not load live analytics and alerts');
+    }
+  }, [api]);
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+  const saveRules = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    void api('/api/alerts/rules', {
+      method: 'PUT',
+      body: JSON.stringify({
+        errorRate: Number(form.get('errorRate')) / 100,
+        p95LatencyMs: Number(form.get('p95LatencyMs')),
+        trafficSpikeMultiplier: Number(form.get('trafficSpikeMultiplier')),
+      }),
+    })
+      .then(load)
+      .catch((e: Error) => setError(e.message));
+  };
+  return (
+    <>
+      <section className="stats">
+        {[
+          ['P50 latency', metrics?.p50ResponseMs],
+          ['P95 latency', metrics?.p95ResponseMs],
+          ['P99 latency', metrics?.p99ResponseMs],
+          ['Requests / sec', metrics?.requestsPerSecond],
+          ['Error rate', metrics ? `${(metrics.errorRate * 100).toFixed(2)}%` : undefined],
+          ['Cache hit ratio', metrics ? `${(metrics.cacheHitRate * 100).toFixed(2)}%` : undefined],
+        ].map(([label, value]) => (
+          <article className="stat" key={String(label)}>
+            <span>{label}</span>
+            <b>{typeof value === 'number' ? `${value.toFixed(2)} ms` : (value ?? '—')}</b>
+          </article>
+        ))}
+      </section>
+      {error && <div className="alert error">{error}</div>}
+      <section className="panel">
+        <h2>Route traffic</h2>
+        {routes.length ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Route</th>
+                  <th>Requests (recent sample)</th>
+                  <th>5xx responses</th>
+                  <th>Server error rate</th>
+                </tr>
+              </thead>
+              <tbody>
+                {routes.map((route) => {
+                  const requests = metrics?.routeTraffic?.[route.id] ?? 0;
+                  const errors = metrics?.routeErrors?.[route.id] ?? 0;
+                  return (
+                    <tr key={route.id}>
+                      <td>
+                        {route.path}
+                        <small>{route.id}</small>
+                      </td>
+                      <td>{requests}</td>
+                      <td>{errors}</td>
+                      <td>{requests ? `${((errors / requests) * 100).toFixed(2)}%` : '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty">No routes configured.</div>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Alert thresholds</h2>
+            <p>
+              Alerts are evaluated from live gateway metrics and upstream health during polling.
+            </p>
+          </div>
+        </div>
+        {data && (
+          <form className="form-grid" onSubmit={saveRules}>
+            <label>
+              Error rate threshold (%)
+              <input
+                name="errorRate"
+                type="number"
+                min="0.1"
+                max="100"
+                step="0.1"
+                defaultValue={data.rules.errorRate * 100}
+                disabled={readOnly}
+              />
+            </label>
+            <label>
+              P95 latency threshold (ms)
+              <input
+                name="p95LatencyMs"
+                type="number"
+                min="1"
+                max="300000"
+                defaultValue={data.rules.p95LatencyMs}
+                disabled={readOnly}
+              />
+            </label>
+            <label>
+              Traffic spike multiplier
+              <input
+                name="trafficSpikeMultiplier"
+                type="number"
+                min="1.1"
+                max="10"
+                step="0.1"
+                defaultValue={data.rules.trafficSpikeMultiplier}
+                disabled={readOnly}
+              />
+            </label>
+            {!readOnly && <button className="primary">Save thresholds</button>}
+          </form>
+        )}
+      </section>
+      <section className="panel">
+        <h2>Alert history</h2>
+        {data?.alerts.length ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Alert</th>
+                  <th>Details</th>
+                  <th>Related</th>
+                  <th>State</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.alerts.map((item) => (
+                  <tr key={item.id}>
+                    <td>{new Date(item.createdAt).toLocaleString()}</td>
+                    <td>{item.kind.replaceAll('_', ' ')}</td>
+                    <td>{item.message}</td>
+                    <td>{item.related ?? '—'}</td>
+                    <td>
+                      {item.active
+                        ? item.acknowledgedAt
+                          ? 'Acknowledged'
+                          : 'Active'
+                        : `Resolved ${item.resolvedAt ? new Date(item.resolvedAt).toLocaleString() : ''}`}
+                    </td>
+                    <td>
+                      {item.active && !item.acknowledgedAt && !readOnly && (
+                        <button
+                          className="secondary small"
+                          onClick={() =>
+                            void api(`/api/alerts/${item.id}/acknowledge`, { method: 'POST' })
+                              .then(load)
+                              .catch((e: Error) => setError(e.message))
+                          }
+                        >
+                          Acknowledge
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty">No alert conditions have been observed.</div>
+        )}
+      </section>
+    </>
+  );
+}
+
+function RequestInspector({ api }: { api: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+  const [items, setItems] = useState<InspectedRequest[]>([]);
+  const [filter, setFilter] = useState('');
+  const [routeFilter, setRouteFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const [upstreamFilter, setUpstreamFilter] = useState('');
+  const [error, setError] = useState('');
+  const [selected, setSelected] = useState<InspectedRequest | null>(null);
+  const load = useCallback(
+    () =>
+      api<InspectedRequest[]>(
+        `/api/gateway/requests?limit=200${filter ? `&requestId=${encodeURIComponent(filter)}` : ''}${routeFilter ? `&route=${encodeURIComponent(routeFilter)}` : ''}${statusFilter ? `&status=${encodeURIComponent(statusFilter)}` : ''}${upstreamFilter ? `&upstream=${encodeURIComponent(upstreamFilter)}` : ''}`,
+      )
+        .then(setItems)
+        .catch((e: Error) => setError(e.message)),
+    [api, filter, routeFilter, statusFilter, upstreamFilter],
+  );
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(), 3000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <h2>Recent gateway requests</h2>
+          <p>
+            Sanitized metadata retained in a bounded in-memory ring. Request bodies and credentials
+            are never stored.
+          </p>
+        </div>
+        <input
+          aria-label="Filter by request ID"
+          placeholder="Filter request ID"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        />
+        <input
+          aria-label="Filter by route"
+          placeholder="Route ID"
+          value={routeFilter}
+          onChange={(e) => setRouteFilter(e.target.value)}
+        />
+        <input
+          aria-label="Filter by status"
+          placeholder="Status"
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+        />
+        <input
+          aria-label="Filter by upstream"
+          placeholder="Upstream"
+          value={upstreamFilter}
+          onChange={(e) => setUpstreamFilter(e.target.value)}
+        />
+      </div>
+      {error && <div className="alert error">{error}</div>}
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Request ID</th>
+              <th>Request</th>
+              <th>Route</th>
+              <th>Upstream</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>Cache</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <tr key={item.requestId}>
+                <td>{new Date(item.timestamp).toLocaleTimeString()}</td>
+                <td>
+                  <code>{item.requestId}</code>
+                </td>
+                <td>
+                  {item.method} {item.path}
+                </td>
+                <td>{item.routeId ?? '—'}</td>
+                <td>{item.upstream ?? '—'}</td>
+                <td>
+                  <span className={`state-pill ${item.status >= 500 ? 'open' : 'closed'}`}>
+                    {item.status}
+                  </span>
+                </td>
+                <td>{item.durationMs.toFixed(2)} ms</td>
+                <td>{item.cache}</td>
+                <td>
+                  <button
+                    className="secondary small"
+                    onClick={() =>
+                      void api<InspectedRequest>(
+                        `/api/gateway/requests/${encodeURIComponent(item.requestId)}`,
+                      )
+                        .then(setSelected)
+                        .catch((e: Error) => setError(e.message))
+                    }
+                  >
+                    Details
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {selected && (
+        <div className="panel nested">
+          <div className="panel-head">
+            <h3>Request {selected.requestId}</h3>
+            <button className="secondary small" onClick={() => setSelected(null)}>
+              Close
+            </button>
+          </div>
+          <dl className="detail-grid">
+            {[
+              ['Route', selected.routeId ?? 'unmatched'],
+              ['Status', selected.status],
+              ['Total duration', `${selected.durationMs.toFixed(2)} ms`],
+              ['Upstream duration', `${(selected.upstreamDurationMs ?? 0).toFixed(2)} ms`],
+              ['Retry count', selected.retryCount ?? 0],
+              ['Circuit decision', selected.circuitDecision ?? '—'],
+              ['Rate-limit decision', selected.rateLimitDecision ?? '—'],
+              ['Cache', selected.cache],
+            ].map(([label, value]) => (
+              <div key={String(label)}>
+                <dt>{label}</dt>
+                <dd>{value}</dd>
+              </div>
+            ))}
+          </dl>
+        </div>
+      )}
+      {!items.length && !error && (
+        <div className="empty">No gateway requests have been recorded yet.</div>
+      )}
+    </section>
   );
 }
 
@@ -860,6 +1634,137 @@ function AnalyticsPanel({
     <>
       {error && <div className="alert error">{error}</div>}
       <MetricsCharts metrics={metrics} health={health} routes={routes} />
+    </>
+  );
+}
+
+function ReliabilityPanel({ api }: { api: <T>(path: string, init?: RequestInit) => Promise<T> }) {
+  const [metrics, setMetrics] = useState<Metrics | null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    const load = () =>
+      void api<Metrics>('/api/gateway/metrics')
+        .then((value) => {
+          if (active) {
+            setMetrics(value);
+            setError('');
+          }
+        })
+        .catch((reason: Error) => {
+          if (active) setError(reason.message);
+        });
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [api]);
+  const upstreams = metrics?.upstreams?.upstreams ?? [];
+  const events = metrics?.upstreams?.circuitEvents ?? [];
+  return (
+    <>
+      {error && <div className="alert error">{error}</div>}
+      <section className="stats">
+        {[
+          ['Retry attempts', metrics?.retryAttempts ?? '—'],
+          ['Retry recoveries', metrics?.retrySuccesses ?? '—'],
+          ['Retry exhaustion', metrics?.retryExhausted ?? '—'],
+          ['Open circuit rejections', metrics?.circuitOpenRejections ?? '—'],
+        ].map(([label, value]) => (
+          <article className="stat" key={label}>
+            <span>{label}</span>
+            <b>{value}</b>
+          </article>
+        ))}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Upstream reliability</h2>
+            <p>Live circuit state, active requests and response time by route target.</p>
+          </div>
+        </div>
+        {upstreams.length ? (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Route / upstream</th>
+                  <th>Algorithm</th>
+                  <th>Circuit</th>
+                  <th>Requests / failures</th>
+                  <th>Failures</th>
+                  <th>Active</th>
+                  <th>Avg response</th>
+                  <th>Last transition</th>
+                </tr>
+              </thead>
+              <tbody>
+                {upstreams.map((item) => (
+                  <tr key={`${item.routeId}|${item.upstream}`}>
+                    <td>
+                      {item.routeId}
+                      <small>{item.upstream}</small>
+                    </td>
+                    <td>{item.algorithm.replaceAll('_', ' ')}</td>
+                    <td>
+                      <span className={`state-pill ${item.circuitState.toLowerCase()}`}>
+                        {item.circuitState}
+                      </span>
+                    </td>
+                    <td>
+                      {item.requests} / {(item.failureRate * 100).toFixed(2)}%
+                    </td>
+                    <td>
+                      {item.consecutiveFailures} / {item.failures}
+                    </td>
+                    <td>{item.activeConnections}</td>
+                    <td>{item.averageResponseMs.toFixed(2)} ms</td>
+                    <td>
+                      {item.lastTransition ? new Date(item.lastTransition).toLocaleString() : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="chart-empty">No upstream telemetry received yet.</div>
+        )}
+      </section>
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Circuit transitions</h2>
+            <p>Most recent state changes from the live gateway.</p>
+          </div>
+        </div>
+        {events.length ? (
+          <div className="decision-list">
+            {[...events]
+              .reverse()
+              .slice(0, 30)
+              .map((event, index) => (
+                <article key={`${event.at}-${index}`}>
+                  <b>
+                    {event.from} → {event.to}
+                  </b>
+                  <span>
+                    {event.routeId} · {event.upstream}
+                  </span>
+                  <small>
+                    {new Date(event.at).toLocaleString()} · {event.reason} ({event.failures}{' '}
+                    failures)
+                  </small>
+                </article>
+              ))}
+          </div>
+        ) : (
+          <div className="chart-empty">No circuit transitions recorded.</div>
+        )}
+      </section>
     </>
   );
 }
@@ -1192,6 +2097,25 @@ function Routes({
       spikeSensitivity: Number(form.get('spikeSensitivity')),
       recoveryCooldownMs: Number(form.get('recoveryCooldownMs')),
       cacheTtlMs: Number(form.get('cacheTtlMs')),
+      loadBalancingAlgorithm: form.get('loadBalancingAlgorithm'),
+      circuitBreakerEnabled: form.get('circuitBreakerEnabled') === 'on',
+      circuitFailureThreshold: Number(form.get('circuitFailureThreshold')),
+      circuitRecoveryTimeoutMs: Number(form.get('circuitRecoveryTimeoutMs')),
+      circuitHalfOpenProbes: Number(form.get('circuitHalfOpenProbes')),
+      maxRetries: Number(form.get('maxRetries')),
+      retryBackoffMs: Number(form.get('retryBackoffMs')),
+      retryMaxBackoffMs: Number(form.get('retryMaxBackoffMs')),
+      retryJitter: form.get('retryJitter') === 'on',
+      retryStatuses: String(form.get('retryStatuses'))
+        .split(',')
+        .map((status) => Number(status.trim()))
+        .filter((status) => status > 0),
+      retryConnectionErrors: form.get('retryConnectionErrors') === 'on',
+      retryTimeouts: form.get('retryTimeouts') === 'on',
+      retryNonIdempotent: form.get('retryNonIdempotent') === 'on',
+      upstreamGroups: String(form.get('upstreamGroups') ?? '').trim()
+        ? JSON.parse(String(form.get('upstreamGroups')))
+        : null,
       enabled: form.get('enabled') === 'on',
     };
     void run(async () => {
@@ -1333,12 +2257,149 @@ function Routes({
               />
             </label>
             <label>
+              Load balancing
+              <select
+                name="loadBalancingAlgorithm"
+                defaultValue={editing?.loadBalancingAlgorithm ?? 'WEIGHTED_ROUND_ROBIN'}
+              >
+                <option value="ROUND_ROBIN">Round robin</option>
+                <option value="WEIGHTED_ROUND_ROBIN">Weighted round robin</option>
+                <option value="LEAST_CONNECTIONS">Least connections</option>
+                <option value="LEAST_RESPONSE_TIME">Least response time</option>
+              </select>
+            </label>
+            <label className="check-label">
+              <input
+                name="circuitBreakerEnabled"
+                type="checkbox"
+                defaultChecked={editing?.circuitBreakerEnabled ?? false}
+              />{' '}
+              Enable upstream circuit breaker
+            </label>
+            <label>
+              Failure threshold
+              <input
+                name="circuitFailureThreshold"
+                type="number"
+                min="1"
+                max="1000"
+                defaultValue={editing?.circuitFailureThreshold ?? 5}
+              />
+            </label>
+            <label>
+              Recovery timeout (ms)
+              <input
+                name="circuitRecoveryTimeoutMs"
+                type="number"
+                min="100"
+                max="3600000"
+                defaultValue={editing?.circuitRecoveryTimeoutMs ?? 30000}
+              />
+            </label>
+            <label>
+              Half-open probes
+              <input
+                name="circuitHalfOpenProbes"
+                type="number"
+                min="1"
+                max="100"
+                defaultValue={editing?.circuitHalfOpenProbes ?? 1}
+              />
+            </label>
+            <label>
+              Maximum retries
+              <input
+                name="maxRetries"
+                type="number"
+                min="0"
+                max="5"
+                defaultValue={editing?.maxRetries ?? 0}
+              />
+            </label>
+            <label>
+              Retry backoff (ms)
+              <input
+                name="retryBackoffMs"
+                type="number"
+                min="0"
+                max="30000"
+                defaultValue={editing?.retryBackoffMs ?? 50}
+              />
+            </label>
+            <label>
+              Maximum backoff (ms)
+              <input
+                name="retryMaxBackoffMs"
+                type="number"
+                min="0"
+                max="300000"
+                defaultValue={editing?.retryMaxBackoffMs ?? 1000}
+              />
+            </label>
+            <label>
+              Retryable status codes
+              <input
+                name="retryStatuses"
+                defaultValue={editing?.retryStatuses?.join(', ') ?? ''}
+                placeholder="502, 503, 504"
+              />
+            </label>
+            <label className="check-label">
+              <input
+                name="retryConnectionErrors"
+                type="checkbox"
+                defaultChecked={editing?.retryConnectionErrors ?? false}
+              />{' '}
+              Retry connection errors
+            </label>
+            <label className="check-label">
+              <input
+                name="retryTimeouts"
+                type="checkbox"
+                defaultChecked={editing?.retryTimeouts ?? false}
+              />{' '}
+              Retry upstream timeouts
+            </label>
+            <label className="check-label">
+              <input
+                name="retryJitter"
+                type="checkbox"
+                defaultChecked={editing?.retryJitter ?? false}
+              />{' '}
+              Add backoff jitter
+            </label>
+            <label className="check-label">
+              <input
+                name="retryNonIdempotent"
+                type="checkbox"
+                defaultChecked={editing?.retryNonIdempotent ?? false}
+              />{' '}
+              Allow unsafe method retries with Idempotency-Key
+            </label>
+            <label>
               Rewrite prefix
               <input
                 name="rewritePrefix"
                 defaultValue={editing?.rewritePrefix ?? ''}
                 placeholder="Optional, e.g. /users"
               />
+            </label>
+            <label className="full-width">
+              Canary traffic groups (JSON, optional)
+              <textarea
+                name="upstreamGroups"
+                rows={5}
+                defaultValue={
+                  editing?.upstreamGroups ? JSON.stringify(editing.upstreamGroups, null, 2) : ''
+                }
+                placeholder={
+                  '[{"id":"stable","name":"Stable","percentage":90,"targets":[{"url":"http://localhost:4001","weight":1}]},{"id":"canary","name":"Canary","percentage":10,"targets":[{"url":"http://localhost:4003","weight":1}]}]'
+                }
+              />
+              <small>
+                Each target must already be registered and enabled for this service; percentages
+                must total 100.
+              </small>
             </label>
             <label className="check-label">
               <input
@@ -1405,6 +2466,20 @@ function Routes({
                               spikeSensitivity: route.spikeSensitivity ?? 2,
                               recoveryCooldownMs: route.recoveryCooldownMs ?? 30000,
                               cacheTtlMs: route.cacheTtlMs ?? 0,
+                              loadBalancingAlgorithm:
+                                route.loadBalancingAlgorithm ?? 'WEIGHTED_ROUND_ROBIN',
+                              circuitBreakerEnabled: route.circuitBreakerEnabled ?? false,
+                              circuitFailureThreshold: route.circuitFailureThreshold ?? 5,
+                              circuitRecoveryTimeoutMs: route.circuitRecoveryTimeoutMs ?? 30000,
+                              circuitHalfOpenProbes: route.circuitHalfOpenProbes ?? 1,
+                              maxRetries: route.maxRetries ?? 0,
+                              retryBackoffMs: route.retryBackoffMs ?? 50,
+                              retryMaxBackoffMs: route.retryMaxBackoffMs ?? 1000,
+                              retryJitter: route.retryJitter ?? false,
+                              retryStatuses: route.retryStatuses ?? [],
+                              retryConnectionErrors: route.retryConnectionErrors ?? false,
+                              retryTimeouts: route.retryTimeouts ?? false,
+                              retryNonIdempotent: route.retryNonIdempotent ?? false,
                               enabled: !route.enabled,
                             }),
                           });

@@ -15,6 +15,7 @@
     "test:gateway": "go -C services/gateway test ./...",
     "test:control-api": "npm run test --workspace @gatekeeper/control-plane",
     "test:sample-services": "npm run test --prefix services/user-service && npm run test --prefix services/product-service",
+    "test:integration": "powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/integration/acceptance.ps1",
     "start:local": "powershell -ExecutionPolicy Bypass -File ./scripts/start-all.ps1"
   },
   "devDependencies": {

@@ -119,6 +119,19 @@ func TestRequestLoggingExcludesSensitiveHeaders(t *testing.T) {
 	}
 }
 
+func TestStatusWriterTreatsInformationalResponseAsInterim(t *testing.T) {
+	underlying := httptest.NewRecorder()
+	writer := &statusWriter{ResponseWriter: underlying}
+	writer.WriteHeader(http.StatusContinue)
+	if writer.status != 0 {
+		t.Fatalf("interim 100 Continue was recorded as final status %d", writer.status)
+	}
+	writer.WriteHeader(http.StatusCreated)
+	if writer.status != http.StatusCreated {
+		t.Fatalf("final status = %d, want %d", writer.status, http.StatusCreated)
+	}
+}
+
 func TestTimeoutRoundTripperTimesOutUpstream(t *testing.T) {
 	transport := timeoutRoundTripper{
 		next: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
