@@ -88,7 +88,7 @@ func (m *Manager) rateLimitDecision(route Route, client string, now time.Time) R
 		s.adaptive[route.ID] = state
 	}
 	if state.overrideLimit > 0 && state.overrideExpiry > 0 && state.overrideExpiry <= now.UnixMilli() {
-		m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "administrator_override_expired", At: now.UTC(), Explanation: "The temporary administrator override expired; automatic route limits resumed.", EffectiveLimit: state.effective})
+		m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "administrator_override_expired", At: now.UTC(), Explanation: "The temporary administrator override expired; automatic route protection resumed.", EffectiveLimit: state.effective})
 		state.overrideLimit, state.overrideExpiry = 0, 0
 	}
 	adaptive := route.RateLimitMode == "ADAPTIVE" && route.AdaptiveEnabled
@@ -252,12 +252,12 @@ func (m *Manager) evaluateAdaptiveLocked(route Route, state *adaptiveRouteState,
 			if newLimit < state.effective {
 				state.effective = newLimit
 				state.lastAdapted = now
-				m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "spike_detected", At: now.UTC(), Explanation: fmt.Sprintf("Incoming route traffic reached %.2fx baseline (%.2f vs %.2f requests/second).", incoming/maxFloat(state.baselineRPS, 0.001), incoming, state.baselineRPS), EffectiveLimit: newLimit})
-				m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "effective_limit_reduced", At: now.UTC(), Explanation: "The effective per-IP limit was reduced by 25% to protect this route from the traffic spike.", EffectiveLimit: newLimit})
+				m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "spike_detected", At: now.UTC(), Explanation: fmt.Sprintf("Incoming route traffic reached %.2fx baseline (%.2f vs %.2f requests/sec).", incoming/state.baselineRPS, incoming, state.baselineRPS), EffectiveLimit: state.effective})
+				m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "effective_limit_reduced", At: now.UTC(), Explanation: "The effective per-IP limit was reduced by 25% to protect this route.", EffectiveLimit: state.effective})
 				return
 			}
 		}
-		m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "spike_detected", At: now.UTC(), Explanation: fmt.Sprintf("Incoming route traffic reached %.2fx baseline (%.2f vs %.2f requests/second).", incoming/maxFloat(state.baselineRPS, 0.001), incoming, state.baselineRPS), EffectiveLimit: state.effective})
+		m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "spike_detected", At: now.UTC(), Explanation: fmt.Sprintf("Incoming route traffic reached %.2fx baseline (%.2f vs %.2f requests/sec).", incoming/state.baselineRPS, incoming, state.baselineRPS), EffectiveLimit: state.effective})
 		return
 	}
 	if state.baselineRPS == 0 {
@@ -270,12 +270,12 @@ func (m *Manager) evaluateAdaptiveLocked(route Route, state *adaptiveRouteState,
 		if !state.recovering {
 			state.recovering = true
 			state.lastRecovery = now
-			m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "recovery_started", At: now.UTC(), Explanation: "Traffic has stabilized through the recovery cooldown; the effective limit will rise gradually.", EffectiveLimit: state.effective})
+			m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "recovery_started", At: now.UTC(), Explanation: "Traffic has stabilized through the recovery cooldown; the effective limit is recovering.", EffectiveLimit: state.effective})
 		} else if now.Sub(state.lastRecovery) >= cooldown {
 			step := max(1, int(math.Ceil(float64(base)*0.05)))
 			state.effective = min(min(base, maximum), state.effective+step)
 			state.lastRecovery, state.lastAdapted = now, now
-			m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "effective_limit_increased", At: now.UTC(), Explanation: fmt.Sprintf("Stable traffic allowed a gradual increase of %d requests/minute.", step), EffectiveLimit: state.effective})
+			m.addAdaptiveDecisionLocked(AdaptiveDecision{RouteID: route.ID, Type: "effective_limit_increased", At: now.UTC(), Explanation: fmt.Sprintf("Stable traffic allowed a gradual increase of %d requests/sec.", step), EffectiveLimit: state.effective})
 			if state.effective >= min(base, maximum) {
 				state.recovering = false
 			}
@@ -344,7 +344,7 @@ func (m *Manager) AdaptiveTelemetry() map[string]any {
 				status = "recovering"
 			}
 		}
-		result = append(result, map[string]any{"routeId": route.ID, "path": route.Path, "mode": route.RateLimitMode, "enabled": route.AdaptiveEnabled, "baselineReliable": state.evaluations >= 3 && state.baselineRPS > 0, "baseLimit": route.RateLimit, "effectiveLimit": effective, "minimumLimit": minimum, "maximumLimit": maximum, "baselineRps": state.baselineRPS, "incomingRps": incoming, "spikesDetected": state.spikes, "throttledRequests": s.throttled[route.ID], "lastAdaptationTime": nullableTime(state.lastAdapted), "recoveryStatus": status, "manualOverrideExpiresAt": route.ManualOverrideExpiresAt, "timeseries": series, "recentThrottled": varThrottled})
+		result = append(result, map[string]any{"routeId": route.ID, "path": route.Path, "mode": route.RateLimitMode, "enabled": route.AdaptiveEnabled, "baselineReliable": state.evaluations >= 3 && state.baselineRPS > 0, "effectiveLimit": effective, "status": status, "incomingRps": incoming, "throttled": varThrottled, "minimum": minimum, "maximum": maximum, "series": series})
 	}
 	decisions := append([]AdaptiveDecision(nil), s.decisions...)
 	sort.Slice(decisions, func(i, j int) bool { return decisions[i].At.After(decisions[j].At) })
@@ -366,3 +366,4 @@ func (m *Manager) AdaptiveHistory() []AdaptiveDecision {
 	sort.Slice(result, func(i, j int) bool { return result[i].At.After(result[j].At) })
 	return result
 }
+

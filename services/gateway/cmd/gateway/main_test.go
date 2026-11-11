@@ -90,7 +90,7 @@ func TestWatchConfigFileReloadsValidSnapshotsAndKeepsLastGood(t *testing.T) {
 	if manager.Current().Version != "1" {
 		t.Fatal("valid configuration file was not loaded")
 	}
-	if err := os.WriteFile(path, []byte(`{"version":"2","routes":[{"id":"bad","serviceId":"bad","path":"/bad","matchMode":"PREFIX","methods":["GET"],"timeoutMs":0,"enabled":true,"targets":[{"url":"http://localhost:1","weight":1}]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":"2","routes":[{"id":"bad","serviceId":"bad","path":"/bad","matchMode":"PREFIX","methods":["GET"],"timeoutMs":0,"enabled":true,"targets":[{"url":"http://127.0.0.1:4001","weight":1}]}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(1200 * time.Millisecond)
@@ -135,3 +135,4 @@ func TestPollInvalidConfigurationRetainsLastGoodAndRejects(t *testing.T) {
 		t.Fatalf("active version=%s acknowledgement=%s", manager.Current().Version, ackStatus)
 	}
 }
+

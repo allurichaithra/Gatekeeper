@@ -240,3 +240,4 @@ func TestAdaptiveTelemetryAndAdministratorOverrideAudit(t *testing.T) {
 		t.Fatalf("override history=%+v", manager.AdaptiveHistory())
 	}
 }
+
